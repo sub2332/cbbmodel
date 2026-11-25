@@ -1,0 +1,79 @@
+name: Update CBB predictions
+
+on:
+  schedule:
+    # Times are UTC. College basketball runs on Central Standard Time (UTC-6) all season.
+    # Only November through April.
+    - cron: "0 13 * 11,12,1,2,3,4 *"    # 7:00 AM Central: last night's results in, today's slate posted
+    - cron: "30 18 * 11,12,1,2,3,4 *"   # 12:30 PM Central: midday data refresh, before the early tips
+    - cron: "30 23 * 11,12,1,2,3,4 *"   # 5:30 PM Central: fresher betting lines before the night games
+  workflow_dispatch:                     # "Run workflow" button on the Actions tab
+    inputs:
+      predict_date:
+        description: "Day to predict (YYYY-MM-DD). Leave blank for the next day with games."
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: cbb-site
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      has_page: ${{ steps.check.outputs.has_page }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install packages
+        run: pip install -r requirements.txt
+
+      # Keeps the ~85 MB of downloaded data (and team logos) between runs, so only the current season is re-downloaded.
+      - name: Restore data cache
+        uses: actions/cache@v4
+        with:
+          path: cbb_data_cache
+          key: cbb-data-${{ github.run_id }}
+          restore-keys: cbb-data-
+
+      - name: Run the model
+        env:
+          CBB_OUTPUT_PATH: site/index.html
+          CBB_CACHE_DIR: cbb_data_cache
+          CBB_PREDICT_DATE: ${{ github.event.inputs.predict_date }}
+        run: python cbb-predictor.py
+
+      - name: Check for a report
+        id: check
+        run: |
+          if [ -f site/index.html ]; then echo "has_page=true" >> "$GITHUB_OUTPUT"; else echo "has_page=false" >> "$GITHUB_OUTPUT"; echo "No games to predict; keeping the current page."; fi
+
+      - name: Upload the page
+        if: steps.check.outputs.has_page == 'true'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    if: needs.build.outputs.has_page == 'true'
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Publish to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
