@@ -231,6 +231,8 @@ REPORT_FILENAME = "cbb_predictions.html"
 OPEN_REPORT_IN_BROWSER = not os.environ.get("CI")
 LOGO_MODE = "embed"                    # "embed" (logos baked into the file), "link" (needs internet to view) or "none"
 LOGO_PX = 64
+FETCH_LIVE_SCORES = True               # fill in final scores from ESPN's live scoreboard for yesterday and today (the data
+                                       # source only updates during the day, so last night's results would otherwise be missing)
 FETCH_ODDS = True                      # look up today's betting lines from ESPN's public scoreboard (shown, not used)
 TRAP_TOP_N = 64                        # the Trapezoid and efficiency-landscape charts show the top N teams by efficiency margin
 MARKET_FLAG_PTS = 10.0                 # flag a game when the model differs from the moneyline by this many points
@@ -354,8 +356,10 @@ def load_season_files(seasons, cur):
             (pd.concat(players, ignore_index=True) if players else pd.DataFrame(columns=PLAYER_COLS)))
 
 
-def build_games(sched):
-    """One row per game: ids, local game day and tip time, site, scores, completion."""
+def build_games(sched, finals=None):
+    """One row per game: ids, local game day and tip time, site, scores, completion.
+    finals: {game_id: (home_id, home_score, away_id, away_score)} from the live scoreboard, for games the data
+    source has not caught up on yet."""
     g = sched.copy()
     for c in SCHED_COLS:
         if c not in g.columns:
@@ -376,6 +380,16 @@ def build_games(sched):
     g["conf_game"] = g["conference_competition"].astype(str).str.lower().isin(["true", "1", "1.0"]).astype(int)
     for c in ("home_score", "away_score", "status_period"):
         g[c] = pd.to_numeric(g[c], errors="coerce")
+    if finals:
+        for i, gid, hid in zip(g.index, g["game_id"].values, g["home_id"].values):
+            f_ = finals.get(int(gid))
+            if f_ is None:
+                continue
+            hs, as_ = (f_[1], f_[3]) if f_[0] == hid else (f_[3], f_[1])
+            if not (pd.notna(g.at[i, "home_score"]) and g.at[i, "home_score"] + g.at[i, "away_score"] > 0
+                    and str(g.at[i, "status_type_completed"]).lower() in ("true", "1", "1.0")):
+                g.at[i, "home_score"], g.at[i, "away_score"] = hs, as_
+                g.at[i, "status_type_completed"] = True
     done = g["status_type_completed"].astype(str).str.lower().isin(["true", "1", "1.0"])
     done &= g["home_score"].notna() & g["away_score"].notna() & ((g["home_score"] + g["away_score"]) > 0)
     if AS_OF_DATE:                                        # test mode: hide everything from that day on
@@ -1822,6 +1836,51 @@ def _num(x):
         return np.nan
 
 
+_SCOREBOARD = {}
+
+
+def fetch_scoreboard(d):
+    """ESPN's public scoreboard JSON for one day (D1 games), cached per run. None if it can't be reached."""
+    key = f"{d:%Y%m%d}"
+    if key not in _SCOREBOARD:
+        url = ("https://site.api.espn.com/apis/site/v2/sports/basketball/mens-college-basketball/scoreboard"
+               f"?dates={key}&groups=50&limit=500")
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                _SCOREBOARD[key] = json.loads(resp.read().decode("utf-8"))
+        except Exception as ex:
+            print(f"  ! ESPN scoreboard for {d:%b %d} unavailable ({ex})")
+            _SCOREBOARD[key] = None
+    return _SCOREBOARD[key]
+
+
+def fetch_live_finals(days):
+    """{game_id: (home_id, home_score, away_id, away_score)} for games ESPN lists as final on these days."""
+    out = {}
+    if not FETCH_LIVE_SCORES or AS_OF_DATE:
+        return out
+    for d in days:
+        data = fetch_scoreboard(d)
+        for ev in (data or {}).get("events", []):
+            try:
+                st = (ev.get("status") or {}).get("type") or {}
+                if not st.get("completed"):
+                    continue
+                comp = ev["competitions"][0]
+                h = next(c for c in comp["competitors"] if c.get("homeAway") == "home")
+                a = next(c for c in comp["competitors"] if c.get("homeAway") == "away")
+                hs, as_ = float(h.get("score")), float(a.get("score"))
+                if hs + as_ <= 0:
+                    continue
+                out[int(ev["id"])] = (int(h.get("id") or h["team"]["id"]), hs, int(a.get("id") or a["team"]["id"]), as_)
+            except Exception:
+                continue
+    if out:
+        print(f"  Live scoreboard: {len(out)} final(s) for {', '.join(f'{d:%b %d}' for d in days)}")
+    return out
+
+
 def fetch_odds(days):
     """{game_id: {spread (positive = home favored), total, ml_home, ml_away, prob}} from ESPN's public scoreboard.
     Shown on the cards for context only; the model never uses it. Anything that fails is skipped."""
@@ -1829,14 +1888,8 @@ def fetch_odds(days):
     if not FETCH_ODDS:
         return out
     for d in days:
-        url = ("https://site.api.espn.com/apis/site/v2/sports/basketball/mens-college-basketball/scoreboard"
-               f"?dates={d:%Y%m%d}&groups=50&limit=500")
-        try:
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=20) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-        except Exception as ex:
-            print(f"  ! betting lines for {d:%b %d} unavailable ({ex})")
+        data = fetch_scoreboard(d)
+        if not data:
             continue
         for ev in data.get("events", []):
             try:
@@ -2632,6 +2685,24 @@ def write_html_report(pred, report, st, names, logos, tuning, charts=None):
         return f'<div class="vegas"><span class="k">Vegas</span>{a_row}{h_row}{sub}{mm}{ag}{flag}{ats}</div>'
 
     rows_ = pred["rows"]
+    latest_html = ""
+    rec0 = report.get("record")
+    if rec0 and rec0.get("rows"):
+        prev = [x for x in rec0["rows"] if x["day"] < pred["days"][0]]
+        if prev:
+            ld = max(x["day"] for x in prev)
+            lr = [x for x in prev if x["day"] == ld]
+            w_ = sum(x["ok"] for x in lr)
+            body = "".join(
+                f'<tr><td>{tm(x["away"])} @ {tm(x["home"])}</td><td>{tm(x["pick"])}</td><td class="num">{x["conf"] * 100:.0f}%</td>'
+                f'<td class="num">{e(x["score"])}</td><td><b style="color:{"#2e9e5b" if x["ok"] else "#c0392b"}">'
+                f'{"Correct" if x["ok"] else "Wrong"}</b></td></tr>' for x in sorted(lr, key=lambda x: -x["conf"]))
+            latest_html = (f'<details class="edges"><summary style="cursor:pointer"><b>Latest results, {ld:%a %b %d}: {w_}-{len(lr) - w_} '
+                           f'({100 * w_ / len(lr):.0f}%)</b> <span class="note">tap to see every game</span></summary>'
+                           '<div class="scroll" style="margin-top:8px"><table><tr><th>Game</th><th>Pick</th><th class="num">Confidence</th>'
+                           f'<th class="num">Final (away-home)</th><th>Result</th></tr>{body}</table></div>'
+                           '<div>D1-vs-D1 games, picked before tip-off by the model trained on earlier seasons (the same picks as the season '
+                           'record).</div></details>')
     has_odds = any(r.get("v_prob") == r.get("v_prob") and r.get("v_prob") is not None for r in rows_)
     # ---- where the model and the market disagree most ----
     edge_rows = []
@@ -2965,6 +3036,7 @@ probability of the picked team; the predicted score splits a projected total usi
 {test_note}
 <nav class="toptabs"><button type="button" class="toptab" data-p="p-games">Games</button><button type="button" class="toptab" data-p="p-modelpicks">Model picks</button><button type="button" class="toptab" data-p="p-charts">Charts</button><button type="button" class="toptab" data-p="p-model">Record &amp; accuracy</button><button type="button" class="toptab" data-p="p-league">Teams &amp; ratings</button></nav>
 <div class="toppane" id="p-games">
+{latest_html}
 {edges_html}
 <div class="app"><div class="gside"><input class="gsearch" placeholder="Search a team..."><div class="glist">{"".join(items)}</div></div><div class="gview">{"".join(cards)}</div></div>
 </div>
@@ -3002,9 +3074,10 @@ def main():
     cur = CURRENT_SEASON or season_of(today_local())
     PREDICT_SEASON = cur
     seasons = list(range(FIRST_SEASON, cur + 1))
-    print(f"Loading schedules and box scores {seasons[0]}-{seasons[-1]} (first run downloads ~30 MB, later runs use the cache) ...")
+    print(f"Loading schedules and box scores {seasons[0]}-{seasons[-1]} (the first run downloads ~85 MB, later runs use the cache) ...")
     sched, box, players = load_season_files(seasons, cur)
-    games = build_games(sched)
+    t_ = today_local()
+    games = build_games(sched, fetch_live_finals([t_ - pd.Timedelta(days=1), t_]))
     _DIR.update(team_directory(sched, box))
     names = lambda t: _DIR.get(t, {}).get("short", str(t))
     print(f"  {len(games):,} games ({int(games['completed'].sum()):,} completed), {len(box):,} team box scores, "
